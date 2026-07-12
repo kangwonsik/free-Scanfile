@@ -7,6 +7,7 @@
 
 import io
 import os
+import platform
 
 import cv2
 import img2pdf
@@ -259,19 +260,123 @@ def save_as_pdf(image_bgr: np.ndarray, output_path: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 웹캠 초기화
+# 카메라 초기화 (로컬 OpenCV / 브라우저 이중 지원)
 # ---------------------------------------------------------------------------
 
-def init_camera() -> cv2.VideoCapture:
-    """웹캠을 열고, 실패 시 에러를 표시한다."""
-    if "cap" not in st.session_state:
-        cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            st.error("웹캠을 열 수 없습니다. 카메라 연결을 확인해 주세요.")
-            st.stop()
-        st.session_state.cap = cap
-        st.session_state.current_frame = None
-    return st.session_state.cap
+MAX_CAMERA_INDEX = 5
+
+
+def is_streamlit_cloud() -> bool:
+    """Streamlit Cloud 배포 환경인지 확인한다."""
+    return os.environ.get("STREAMLIT_RUNTIME_ENVIRONMENT") == "cloud"
+
+
+def _init_session_state() -> None:
+    """카메라 관련 세션 상태 기본값을 설정한다."""
+    defaults = {
+        "cap": None,
+        "camera_index": None,
+        "camera_mode": None,       # "browser" | "opencv"
+        "camera_status": "idle",   # "connected" | "failed" | "waiting"
+        "current_frame": None,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def release_camera() -> None:
+    """열린 OpenCV 카메라를 해제한다."""
+    cap = st.session_state.get("cap")
+    if cap is not None:
+        cap.release()
+    st.session_state.cap = None
+    st.session_state.camera_index = None
+
+
+def _open_capture(index: int) -> cv2.VideoCapture:
+    """OS에 맞는 방식으로 카메라를 연다. Windows는 DirectShow 우선 시도."""
+    if platform.system() == "Windows":
+        cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+        if cap.isOpened():
+            return cap
+        cap.release()
+    return cv2.VideoCapture(index)
+
+
+def find_available_camera(max_index: int = MAX_CAMERA_INDEX) -> int | None:
+    """카메라 인덱스 0~N을 순회하며 사용 가능한 장치를 탐색한다."""
+    for index in range(max_index):
+        cap = _open_capture(index)
+        if cap.isOpened():
+            ret, _ = cap.read()
+            cap.release()
+            if ret:
+                return index
+    return None
+
+
+def reinitialize_camera() -> bool:
+    """
+    카메라를 강제로 재탐색·재연결한다.
+    Streamlit Cloud → 브라우저 카메라 모드, 로컬 → OpenCV 인덱스 순회.
+    """
+    release_camera()
+    st.session_state.current_frame = None
+
+    if is_streamlit_cloud():
+        st.session_state.camera_mode = "browser"
+        st.session_state.camera_status = "waiting"
+        return True
+
+    found_index = find_available_camera()
+    if found_index is not None:
+        cap = _open_capture(found_index)
+        if cap.isOpened():
+            st.session_state.cap = cap
+            st.session_state.camera_index = found_index
+            st.session_state.camera_mode = "opencv"
+            st.session_state.camera_status = "connected"
+            return True
+
+    st.session_state.camera_mode = "browser"
+    st.session_state.camera_status = "failed"
+    return False
+
+
+def ensure_camera_ready() -> None:
+    """앱 최초 로딩 시 카메라를 자동 초기화한다."""
+    if st.session_state.camera_mode is None:
+        reinitialize_camera()
+
+
+def bytes_to_bgr(image_bytes: bytes) -> np.ndarray | None:
+    """브라우저 카메라 바이트 데이터를 OpenCV BGR 이미지로 변환한다."""
+    arr = np.frombuffer(image_bytes, dtype=np.uint8)
+    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+
+def show_camera_status() -> None:
+    """카메라 연결 상태를 직관적인 메시지로 표시한다."""
+    status = st.session_state.camera_status
+    mode = st.session_state.camera_mode
+
+    if status == "connected":
+        if mode == "opencv":
+            idx = st.session_state.camera_index
+            st.success(f"✅ 카메라 정상 연결됨 (로컬 장치 인덱스: {idx})")
+        else:
+            st.success("✅ 카메라 정상 연결됨")
+    elif status == "waiting":
+        st.info(
+            "📷 브라우저 카메라 권한을 허용해 주세요. "
+            "아래 카메라 창이 보이면 정상입니다."
+        )
+    else:
+        st.error(
+            "❌ 카메라를 찾을 수 없습니다. "
+            "브라우저의 카메라 권한을 확인하세요."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +384,7 @@ def init_camera() -> cv2.VideoCapture:
 # ---------------------------------------------------------------------------
 
 st.set_page_config(page_title="문서 스캐너", page_icon="📄", layout="centered")
+_init_session_state()
 
 st.title("📄 문서 스캐너")
 st.markdown(
@@ -286,28 +392,59 @@ st.markdown(
     "**테두리를 자동 감지**하여 **A4 비율로 펴서 PDF**로 저장합니다."
 )
 
+# 상단: 카메라 재연결 버튼
+_, retry_col = st.columns([4, 1])
+with retry_col:
+    if st.button("📷 카메라 연결 다시 시도", use_container_width=True):
+        reinitialize_camera()
+        st.rerun()
+
+ensure_camera_ready()
+show_camera_status()
+
 scan_mode = st.toggle(
     "📑 스캔 화질 보정 (어댑티브 스레시홀딩)",
     value=False,
     help="켜면 배경은 하얗게, 글씨는 검게 보정하여 스캔본처럼 선명하게 만듭니다.",
 )
 
-cap = init_camera()
+st.divider()
 
+# 카메라 모드에 따라 미리보기 방식 분기
+if st.session_state.camera_mode == "opencv" and st.session_state.cap is not None:
+    cap = st.session_state.cap
 
-@st.fragment(run_every=0.1)
-def live_camera_feed():
-    """0.1초마다 웹캠 프레임을 갱신하여 실시간 미리보기를 표시한다."""
-    ret, frame = cap.read()
-    if ret:
-        st.session_state.current_frame = frame.copy()
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        st.image(rgb_frame, channels="RGB", use_container_width=True)
-    else:
-        st.warning("카메라에서 영상을 읽을 수 없습니다.")
+    @st.fragment(run_every=0.1)
+    def live_camera_feed():
+        """로컬 환경: OpenCV로 실시간 웹캠 미리보기."""
+        ret, frame = cap.read()
+        if ret:
+            st.session_state.current_frame = frame.copy()
+            st.session_state.camera_status = "connected"
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            st.image(rgb_frame, channels="RGB", use_container_width=True)
+        else:
+            st.session_state.camera_status = "failed"
 
+    live_camera_feed()
 
-live_camera_feed()
+else:
+    # Streamlit Cloud / OpenCV 실패: 브라우저 카메라 사용
+    camera_photo = st.camera_input(
+        "웹캠 미리보기",
+        key="browser_camera",
+        help="브라우저에서 카메라 접근 권한을 허용해야 합니다.",
+    )
+    if camera_photo is not None:
+        frame = bytes_to_bgr(camera_photo.getvalue())
+        if frame is not None:
+            st.session_state.current_frame = frame
+            st.session_state.camera_status = "connected"
+            st.session_state.camera_mode = "browser"
+        else:
+            st.session_state.camera_status = "failed"
+    elif st.session_state.camera_mode == "browser":
+        st.session_state.camera_status = "waiting"
 
 st.divider()
 
@@ -315,7 +452,11 @@ if st.button("📸 문서 캡처 및 PDF 저장", type="primary", use_container_
     frame = st.session_state.get("current_frame")
 
     if frame is None:
-        st.error("캡처할 영상이 없습니다. 카메라가 정상 작동하는지 확인해 주세요.")
+        st.error(
+            "캡처할 영상이 없습니다. "
+            "카메라 권한을 허용했는지 확인하고 "
+            "'📷 카메라 연결 다시 시도' 버튼을 눌러 보세요."
+        )
     else:
         with st.spinner("문서 테두리를 감지하고 보정하는 중..."):
             scanned, method = scan_document(frame)
@@ -347,5 +488,6 @@ st.divider()
 st.caption(
     "💡 **촬영 팁**: 종이를 어두운 책상 위에 놓고, "
     "네 모서리가 화면 안에 들어오도록 카메라를 비스듬히 맞추면 "
-    "자동 테두리 감지가 훨씬 잘 됩니다."
+    "자동 테두리 감지가 훨씬 잘 됩니다. "
+    "웹 배포 환경에서는 브라우저 카메라 권한 허용이 필요합니다."
 )
