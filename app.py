@@ -8,6 +8,7 @@
 import io
 import os
 import platform
+from datetime import datetime
 
 import cv2
 import img2pdf
@@ -246,17 +247,22 @@ def scan_document(image: np.ndarray) -> tuple[np.ndarray, str]:
     return smart_center_crop(image), "crop"
 
 
-def save_as_pdf(image_bgr: np.ndarray, output_path: str) -> None:
-    """BGR 이미지를 PDF 파일로 저장한다."""
+def create_pdf_bytes(image_bgr: np.ndarray) -> bytes:
+    """BGR 이미지를 PDF 바이너리 데이터로 변환한다."""
     image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
     pil_image = Image.fromarray(image_rgb)
 
-    buffer = io.BytesIO()
-    pil_image.save(buffer, format="JPEG", quality=95)
-    buffer.seek(0)
+    jpeg_buffer = io.BytesIO()
+    pil_image.save(jpeg_buffer, format="JPEG", quality=95)
+    jpeg_buffer.seek(0)
 
-    with open(output_path, "wb") as f:
-        f.write(img2pdf.convert(buffer.getvalue()))
+    return img2pdf.convert(jpeg_buffer.getvalue())
+
+
+def generate_pdf_filename() -> str:
+    """오늘 날짜·시간이 포함된 PDF 파일명을 생성한다. 예: 스캔문서_20260713_143025.pdf"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"스캔문서_{timestamp}.pdf"
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +285,10 @@ def _init_session_state() -> None:
         "camera_mode": None,       # "browser" | "opencv"
         "camera_status": "idle",   # "connected" | "failed" | "waiting"
         "current_frame": None,
+        "pdf_bytes": None,
+        "pdf_filename": None,
+        "last_scan_method": None,
+        "last_scanned_preview": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -464,24 +474,39 @@ if st.button("📸 문서 캡처 및 PDF 저장", type="primary", use_container_
             if scan_mode:
                 scanned = apply_scan_enhancement(scanned)
 
-            output_path = os.path.join(os.getcwd(), "scanned_output.pdf")
-            save_as_pdf(scanned, output_path)
+            pdf_bytes = create_pdf_bytes(scanned)
+            pdf_filename = generate_pdf_filename()
 
-        if method == "perspective":
-            st.success(
-                f"✅ 문서 테두리를 감지하여 A4 비율로 펴서 저장했습니다!\n\n"
-                f"PDF 경로: `{output_path}`"
-            )
-        else:
-            st.info(
-                f"ℹ️ 테두리 자동 감지에 실패하여 중심부를 A4 비율로 크롭했습니다.\n\n"
-                f"종이 네 모서리가 화면에 보이도록 카메라 각도를 조절하면 "
-                f"더 정확한 보정이 가능합니다.\n\n"
-                f"PDF 경로: `{output_path}`"
-            )
+            st.session_state.pdf_bytes = pdf_bytes
+            st.session_state.pdf_filename = pdf_filename
+            st.session_state.last_scan_method = method
+            st.session_state.last_scanned_preview = scanned
 
-        st.subheader("보정된 이미지 미리보기")
-        preview_rgb = cv2.cvtColor(scanned, cv2.COLOR_BGR2RGB)
+if st.session_state.get("pdf_bytes"):
+    method = st.session_state.last_scan_method
+
+    if method == "perspective":
+        st.success("✅ 문서 테두리를 감지하여 A4 비율로 펴서 PDF 변환이 완료되었습니다!")
+    else:
+        st.info(
+            "ℹ️ 테두리 자동 감지에 실패하여 중심부를 A4 비율로 크롭했습니다. "
+            "종이 네 모서리가 화면에 보이도록 카메라 각도를 조절하면 "
+            "더 정확한 보정이 가능합니다."
+        )
+
+    st.download_button(
+        label="📥 완성된 스캔 PDF 다운로드 받기",
+        data=st.session_state.pdf_bytes,
+        file_name=st.session_state.pdf_filename,
+        mime="application/pdf",
+        type="primary",
+        use_container_width=True,
+    )
+
+    st.subheader("보정된 이미지 미리보기")
+    preview = st.session_state.last_scanned_preview
+    if preview is not None:
+        preview_rgb = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
         st.image(preview_rgb, channels="RGB", use_container_width=True)
 
 st.divider()
